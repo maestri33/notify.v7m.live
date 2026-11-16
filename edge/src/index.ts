@@ -29,6 +29,7 @@ export type Env = {
   EVOLUTION_API_KEY?: string;
   WHATSAPP_TEST_DRIVER?: string;
   EMAIL?: any;
+  EMAIL_SENDER?: string;
 };
 
 export const app = new Hono<{ Bindings: Env }>();
@@ -213,7 +214,7 @@ const handleSend = async (c: any) => {
   if (!recipient || !content) {
     return c.json({ error: 'Missing mandatory fields: recipient/whatsapp/email and content/text are required' }, 400);
   }
-  if (!c.env.BACKEND_ORIGIN && !c.env.EVOLUTION_URL) {
+  if (!c.env.BACKEND_ORIGIN && !c.env.EVOLUTION_URL && !c.env.EMAIL) {
     return c.json({ ok: false, status: 'failed', error: 'Notification origin is not configured' }, 503);
   }
 
@@ -309,7 +310,7 @@ const handleSend = async (c: any) => {
     } catch {
       return rejectDispatch('Notification queue is unavailable');
     }
-  } else if (channel === 'whatsapp' && c.env.EVOLUTION_URL && !c.env.BACKEND_ORIGIN) {
+  } else if (channel === 'whatsapp' && c.env.EVOLUTION_URL) {
     // Disparo Direto Serverless na Evolution (Go em Producao / Node v2 em Testes)
     try {
       const isV2 = c.env.WHATSAPP_TEST_DRIVER === 'evolution-v2' || c.env.EVOLUTION_URL.includes(':8085');
@@ -405,6 +406,57 @@ const handleSend = async (c: any) => {
         };
       } else {
         return rejectDispatch('WhatsApp provider is unavailable');
+      }
+    }
+  } else if (channel === 'email' && c.env.EMAIL) {
+    try {
+      const sender = body.sender || c.env.EMAIL_SENDER || 'notify@v7m.live';
+      await c.env.EMAIL.send({
+        from: sender,
+        to: recipient,
+        subject: subject || 'Notificação',
+        text: content,
+        html: body.html || undefined,
+      });
+      backendResult = {
+        ok: true,
+        status: 'sent',
+        notification_id: notificationId,
+        driver: 'cloudflare-email-sending',
+      };
+      try {
+        if (c.executionCtx && c.env.DB) {
+          c.executionCtx.waitUntil(
+            c.env.DB.prepare("UPDATE notifications SET status = 'dispatched' WHERE id = ?")
+              .bind(notificationId)
+              .run()
+          );
+        }
+      } catch {}
+    } catch (err: any) {
+      if (isSynchronous) {
+        return rejectDispatch('Email dispatch failed: ' + (err?.message || String(err)), 502);
+      }
+      if (c.env.NOTIFY_QUEUE) {
+        await c.env.NOTIFY_QUEUE.send({
+          notification_id: notificationId,
+          account_slug: accountSlug,
+          channel,
+          recipient,
+          subject,
+          payload: dispatchPayload,
+          is_otp: false,
+          target_path: targetPath,
+          timestamp: new Date().toISOString(),
+        });
+        backendResult = {
+          status: 'queued',
+          notification_id: notificationId,
+          external_id: notificationId,
+          queue: 'notify-events-fallback',
+        };
+      } else {
+        return rejectDispatch('Email dispatch failed: ' + (err?.message || String(err)), 500);
       }
     }
   } else if (c.env.BACKEND_ORIGIN) {
@@ -745,7 +797,7 @@ export const queueHandler = async (
     batch.messages.map(async (message) => {
       const item = message.body;
       try {
-        if (item.channel === 'whatsapp' && env.EVOLUTION_URL && !env.BACKEND_ORIGIN) {
+        if (item.channel === 'whatsapp' && env.EVOLUTION_URL) {
           const isV2 = env.WHATSAPP_TEST_DRIVER === 'evolution-v2' || env.EVOLUTION_URL.includes(':8085');
           const baseEvoUrl = env.EVOLUTION_URL.replace(/\/$/, '');
           const evolutionEndpoint = isV2
@@ -773,6 +825,23 @@ export const queueHandler = async (
           } else {
             message.ack();
             failedIds.push(item.notification_id);
+          }
+          return;
+        }
+
+        if (item.channel === 'email' && env.EMAIL) {
+          try {
+            await env.EMAIL.send({
+              from: item.payload?.sender || env.EMAIL_SENDER || 'notify@v7m.live',
+              to: item.recipient,
+              subject: item.subject || 'Notificação',
+              text: item.payload?.content || item.payload?.text || '',
+              html: item.payload?.html || undefined,
+            });
+            message.ack();
+            successIds.push(item.notification_id);
+          } catch (err: any) {
+            message.retry();
           }
           return;
         }
