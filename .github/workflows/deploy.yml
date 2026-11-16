@@ -1,0 +1,66 @@
+name: CD — Deploy Production (Cloudflare Edge)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'edge/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  test-and-verify:
+    name: 🧪 Pre-Deploy Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: edge/package-lock.json
+
+      - name: Install Edge Dependencies
+        working-directory: edge
+        run: npm ci
+
+      - name: TypeScript Typecheck
+        working-directory: edge
+        run: npx tsc --noEmit
+
+      - name: Run Vitest Suite
+        working-directory: edge
+        run: npm test
+
+  deploy-edge:
+    name: 🚀 Deploy to Cloudflare Workers ($5/mês)
+    needs: test-and-verify
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deploy Worker to Production
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: 'edge'
+          command: deploy
+
+      - name: Warning on Missing Cloudflare Secret
+        if: ${{ env.CLOUDFLARE_API_TOKEN == '' }}
+        run: |
+          echo "::warning title=Secret Pendente::CLOUDFLARE_API_TOKEN não está definida em Settings > Secrets do repositório. O build e os testes passaram com 100% de sucesso. Configure o segredo para publicação automática contínua na Cloudflare."
