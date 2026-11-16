@@ -1,30 +1,11 @@
 {
-  "name": "notify",
-  "version": "0.0.1-beta",
-  "description": "Serviço centralizado de mensageria, notificações multicanal e integração de IA multi-tenant construído sobre **Django 5.1**, **Django Ninja (OpenAPI)**, **Django-Q2**, **Evolution GO 0.7.2** e **OmniRouter**.",
-  "main": "index.js",
-  "directories": {
-    "test": "tests"
-  },
+  "name": "notify-gateway",
+  "version": "1.0.0",
+  "description": "Notify Gateway — Cloudflare Serverless Multi-Tenant Messaging (WhatsApp & Email)",
+  "private": true,
   "scripts": {
-    "test": "echo 'No node tests in notify service'",
-    "checkpoint": "sh scripts/checkpoint/checkpoint.sh",
-    "checkpoint:fast": "pwsh scripts/checkpoint/checkpoint.ps1 -Tier fast",
-    "checkpoint:agent": "pwsh scripts/checkpoint/checkpoint.ps1 -Tier agent"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/maestri33/notify-server.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/maestri33/notify-server/issues"
-  },
-  "homepage": "https://github.com/maestri33/notify-server#readme",
-  "devDependencies": {
-    "@playwright/test": "^1.62.1"
+    "test": "npm --prefix edge test",
+    "typecheck": "npm --prefix edge run typecheck",
+    "deploy": "npm --prefix edge run deploy"
   }
 }

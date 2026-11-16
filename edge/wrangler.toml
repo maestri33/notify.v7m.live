@@ -10,7 +10,6 @@ routes = [
 
 [vars]
 ENVIRONMENT = "production"
-BACKEND_ORIGIN = "https://notify-backend.supletivo.net.br"
 EVOLUTION_URL = "https://evolution.supletivo.net.br"
 
 [[d1_databases]]
@@ -20,7 +19,7 @@ database_id = "26eb954c-6172-45a5-8f5a-d1c176b10a35"
 
 [[r2_buckets]]
 binding = "MEDIA"
-bucket_name = "supletivo-media"
+bucket_name = "notify-media"
 
 [ai]
 binding = "AI"
@@ -56,4 +55,3 @@ head_sampling_rate = 1.0
 # ── Cloudflare Email Sending ────────────────────────────────
 [[send_email]]
 name = "EMAIL"
-

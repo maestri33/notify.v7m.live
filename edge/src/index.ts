@@ -21,10 +21,14 @@ export type Env = {
   HYPERDRIVE?: any;
   NOTIFY_QUEUE?: Queue<NotifyQueueMessage>;
   ENVIRONMENT: string;
-  BACKEND_ORIGIN: string;
+  BACKEND_ORIGIN?: string;
   BACKEND_SERVICE_TOKEN?: string;
   NOTIFY_API_KEY?: string;
   NOTIFY_REQUIRE_AUTH?: string | boolean;
+  EVOLUTION_URL?: string;
+  EVOLUTION_API_KEY?: string;
+  WHATSAPP_TEST_DRIVER?: string;
+  EMAIL?: any;
 };
 
 export const app = new Hono<{ Bindings: Env }>();
@@ -46,15 +50,45 @@ function originPayload(payload: Record<string, any>, targetPath: string, notific
 
 async function authorize(request: Request, env: Env): Promise<Response | null> {
   if (env.NOTIFY_REQUIRE_AUTH === false || env.NOTIFY_REQUIRE_AUTH === 'false') return null;
-  if (!env.NOTIFY_API_KEY) return Response.json({ error: 'Notification authentication is not configured' }, { status: 503 });
+  if (!env.NOTIFY_API_KEY) {
+    return Response.json({ error: 'Notification authentication is not configured' }, { status: 503 });
+  }
   const token = request.headers.get('Authorization') || '';
-  const expected = `Bearer ${env.NOTIFY_API_KEY}`;
+  if (!token.startsWith('Bearer ')) {
+    return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  const rawKey = token.replace(/^Bearer\s+/, '').trim();
+
+  // 1. Verificacao da chave mestra global (NOTIFY_API_KEY) via timing-safe SHA-256
   const encoder = new TextEncoder();
-  const [receivedHash, expectedHash] = await Promise.all([token, expected].map(async (value) =>
-    new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value)))));
+  const [receivedHash, expectedHash] = await Promise.all([
+    rawKey,
+    env.NOTIFY_API_KEY,
+  ].map(async (value) => new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value)))));
   let mismatch = 0;
   for (let i = 0; i < receivedHash.length; i++) mismatch |= receivedHash[i] ^ expectedHash[i];
-  return mismatch === 0 ? null : Response.json({ error: 'Unauthorized' }, { status: 401 });
+  if (mismatch === 0) return null;
+
+  // 2. Verificacao Multi-Tenant: autenticacao por API Key individual de cada plataforma no D1
+  if (env.DB) {
+    try {
+      const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(rawKey));
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const keyHash = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+
+      const row: any = await env.DB.prepare(
+        'SELECT id, account_id FROM api_keys WHERE key_hash = ? AND is_active = 1'
+      ).bind(keyHash).first();
+
+      if (row) {
+        return null;
+      }
+    } catch {
+      // Ignora erro se D1 estiver indisponivel
+    }
+  }
+
+  return Response.json({ error: 'Unauthorized' }, { status: 401 });
 }
 
 for (const path of ['/notify', '/v1/send', '/mcp', '/reports/*']) {
@@ -179,7 +213,7 @@ const handleSend = async (c: any) => {
   if (!recipient || !content) {
     return c.json({ error: 'Missing mandatory fields: recipient/whatsapp/email and content/text are required' }, 400);
   }
-  if (!c.env.BACKEND_ORIGIN) {
+  if (!c.env.BACKEND_ORIGIN && !c.env.EVOLUTION_URL) {
     return c.json({ ok: false, status: 'failed', error: 'Notification origin is not configured' }, 503);
   }
 
@@ -249,7 +283,7 @@ const handleSend = async (c: any) => {
     return c.json({ ...details, ok: false, status: details.status || 'failed', error }, status);
   };
 
-  // 3. Encaminhamento assíncrono via Cloudflare Queue (ou direto ao Proxmox via Tunnel)
+  // 3. Encaminhamento assíncrono via Cloudflare Queue ou despacho direto nos canais
   let backendResult: any = { status: 'queued', notification_id: notificationId };
   const shouldEnqueue = !isSynchronous && (body.enqueue === true || body.options?.enqueue === true || body.async === true);
 
@@ -274,6 +308,104 @@ const handleSend = async (c: any) => {
       };
     } catch {
       return rejectDispatch('Notification queue is unavailable');
+    }
+  } else if (channel === 'whatsapp' && c.env.EVOLUTION_URL && !c.env.BACKEND_ORIGIN) {
+    // Disparo Direto Serverless na Evolution (Go em Producao / Node v2 em Testes)
+    try {
+      const isV2 = c.env.WHATSAPP_TEST_DRIVER === 'evolution-v2' || c.env.EVOLUTION_URL.includes(':8085');
+      const baseEvoUrl = c.env.EVOLUTION_URL.replace(/\/$/, '');
+      const evolutionEndpoint = isV2
+        ? baseEvoUrl + '/message/sendText/default'
+        : baseEvoUrl + '/send/text';
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (c.env.EVOLUTION_API_KEY) {
+        headers['apikey'] = c.env.EVOLUTION_API_KEY;
+      }
+
+      const resp = await fetch(evolutionEndpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          number: recipient,
+          text: content,
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (resp.ok) {
+        const evoData: any = await resp.json().catch(() => ({}));
+        backendResult = {
+          ok: true,
+          status: 'sent',
+          notification_id: notificationId,
+          driver: isV2 ? 'evolution-v2' : 'evolution-go',
+          provider_id: evoData?.id || evoData?.messageId || null,
+          evolution_response: evoData,
+        };
+        try {
+          if (c.executionCtx && c.env.DB) {
+            c.executionCtx.waitUntil(
+              c.env.DB.prepare("UPDATE notifications SET status = 'dispatched' WHERE id = ?")
+                .bind(notificationId)
+                .run()
+            );
+          }
+        } catch {}
+      } else {
+        const errorText = await resp.text().catch(() => '');
+        if (isSynchronous) {
+          return rejectDispatch(isOtp ? 'OTP dispatch failed at WhatsApp provider' : 'Synchronous WhatsApp dispatch failed', isOtp ? 502 : 503, { detail: errorText });
+        }
+        if (c.env.NOTIFY_QUEUE) {
+          await c.env.NOTIFY_QUEUE.send({
+            notification_id: notificationId,
+            account_slug: accountSlug,
+            channel,
+            recipient,
+            subject,
+            payload: dispatchPayload,
+            is_otp: false,
+            target_path: targetPath,
+            timestamp: new Date().toISOString(),
+          });
+          backendResult = {
+            status: 'queued',
+            notification_id: notificationId,
+            external_id: notificationId,
+            queue: 'notify-events-fallback',
+          };
+        } else {
+          return rejectDispatch('WhatsApp provider rejected dispatch (' + resp.status + ')');
+        }
+      }
+    } catch (err: any) {
+      if (isSynchronous) {
+        return rejectDispatch(isOtp ? 'OTP dispatch failed to reach WhatsApp provider' : 'Synchronous WhatsApp dispatch failed', isOtp ? 502 : 503);
+      }
+      if (c.env.NOTIFY_QUEUE) {
+        await c.env.NOTIFY_QUEUE.send({
+          notification_id: notificationId,
+          account_slug: accountSlug,
+          channel,
+          recipient,
+          subject,
+          payload: dispatchPayload,
+          is_otp: false,
+          target_path: targetPath,
+          timestamp: new Date().toISOString(),
+        });
+        backendResult = {
+          status: 'queued',
+          notification_id: notificationId,
+          external_id: notificationId,
+          queue: 'notify-events-fallback',
+        };
+      } else {
+        return rejectDispatch('WhatsApp provider is unavailable');
+      }
     }
   } else if (c.env.BACKEND_ORIGIN) {
     try {
@@ -544,10 +676,10 @@ app.get('/reports/delivery-summary', async (c) => {
   return c.json({ account: accountSlug, period_hours: hours, metrics: result.results || [] });
 });
 
-// ── 5.1 Fallback: Encaminhar rotas não tratadas na borda para a origem Django (Azure Core) ──
+// ── 5.1 Fallback: Encaminhar rotas não tratadas na borda para a origem caso configurada ──
 app.all('*', async (c) => {
   if (!c.env.BACKEND_ORIGIN) {
-    return c.json({ error: 'Backend origin not configured' }, 503);
+    return c.json({ error: 'Not Found', path: c.req.path }, 404);
   }
   const targetUrl = new URL(c.req.path + (new URL(c.req.url).search), c.env.BACKEND_ORIGIN);
   const headers = new Headers(c.req.raw.headers);
@@ -592,7 +724,7 @@ export const queueHandler = async (
             .bind(msg.body.notification_id)
         );
       }
-      msg.ack(); // Confirma na DLQ para não reter indefinidamente após auditoria
+      msg.ack();
     }
     if (deadStatements.length > 0 && env.DB) {
       ctx.waitUntil(env.DB.batch(deadStatements));
@@ -601,7 +733,7 @@ export const queueHandler = async (
   }
 
   // 2. Processamento da fila notify-events
-  if (!env.BACKEND_ORIGIN) {
+  if (!env.BACKEND_ORIGIN && !env.EVOLUTION_URL) {
     batch.retryAll();
     return;
   }
@@ -613,6 +745,44 @@ export const queueHandler = async (
     batch.messages.map(async (message) => {
       const item = message.body;
       try {
+        if (item.channel === 'whatsapp' && env.EVOLUTION_URL && !env.BACKEND_ORIGIN) {
+          const isV2 = env.WHATSAPP_TEST_DRIVER === 'evolution-v2' || env.EVOLUTION_URL.includes(':8085');
+          const baseEvoUrl = env.EVOLUTION_URL.replace(/\/$/, '');
+          const evolutionEndpoint = isV2
+            ? baseEvoUrl + '/message/sendText/default'
+            : baseEvoUrl + '/send/text';
+
+          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+          if (env.EVOLUTION_API_KEY) headers['apikey'] = env.EVOLUTION_API_KEY;
+
+          const resp = await fetch(evolutionEndpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              number: item.recipient,
+              text: item.payload?.content || item.payload?.text || '',
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+
+          if (resp.ok) {
+            message.ack();
+            successIds.push(item.notification_id);
+          } else if ([401, 403, 404, 408, 429].includes(resp.status) || resp.status >= 500) {
+            message.retry();
+          } else {
+            message.ack();
+            failedIds.push(item.notification_id);
+          }
+          return;
+        }
+
+        if (!env.BACKEND_ORIGIN) {
+          message.ack();
+          failedIds.push(item.notification_id);
+          return;
+        }
+
         const targetPath = item.target_path || '/v1/send';
         const backendUrl = `${env.BACKEND_ORIGIN.replace(/\/$/, '')}${targetPath}`;
         const headers: Record<string, string> = {
@@ -624,7 +794,6 @@ export const queueHandler = async (
         if (env.NOTIFY_API_KEY) {
           headers['Authorization'] = `Bearer ${env.NOTIFY_API_KEY}`;
         } else if (item.auth_header) {
-          // Compatibility for messages accepted before credentials left the queue payload.
           headers['Authorization'] = item.auth_header;
         }
 
@@ -636,7 +805,6 @@ export const queueHandler = async (
           headers['CF-Access-Client-Secret'] = env.BACKEND_SERVICE_TOKEN;
         }
 
-        // Garante atribuição multi-tenant no corpo JSON para o auth do backend
         const dispatchPayload = {
           ...originPayload(item.payload, targetPath, item.notification_id),
           account_id: item.payload?.account_id || item.account_slug,
@@ -653,15 +821,12 @@ export const queueHandler = async (
           message.ack();
           successIds.push(item.notification_id);
         } else if ([401, 403, 404, 408, 429].includes(resp.status) || resp.status >= 500) {
-          // Rate limiting (429), timeout (408) ou falha de servidor (5xx): reagenda na fila
           message.retry();
         } else {
-          // Erro 4xx de cliente/validação (400, 404, 422): ack para não reter na fila
           message.ack();
           failedIds.push(item.notification_id);
         }
       } catch (err) {
-        // Erro de rede ou timeout: reagenda
         message.retry();
       }
     })
@@ -687,12 +852,10 @@ export const scheduledHandler = async (
 
   ctx.waitUntil(
     (async () => {
-      // 1. Limpar idempotências expiradas (ex: OTPs com TTL 60s)
       await env.DB.prepare(
         "DELETE FROM idempotency_keys WHERE expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP"
       ).run();
 
-      // 2. Limpar notificações com mais de 60 dias
       await env.DB.prepare(
         "DELETE FROM notifications WHERE created_at < datetime('now', '-60 days')"
       ).run();
@@ -701,16 +864,9 @@ export const scheduledHandler = async (
 };
 
 import { handleIncomingEmail } from './email-handler';
-// removed agents SDK
-// removed notify-agent
 
 export default {
   fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
-    if (new URL(request.url).pathname.startsWith('/agents/')) {
-      const rejection = await authorize(request, env);
-      if (rejection) return rejection;
-    }
-    // removed routeAgentRequest
     return app.fetch(request, env, ctx);
   },
   queue: queueHandler,

@@ -5,12 +5,12 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
     "d1:init": "wrangler d1 execute notify-db --file=./schema.sql",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "agents": "^0.25.0",
     "hono": "^4.6.14",
     "postal-mime": "^2.3.0"
   },

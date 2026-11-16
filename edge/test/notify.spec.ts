@@ -336,4 +336,45 @@ describe('POST /notify & /v1/send routing and contracts', () => {
     // OTP nunca deve ser enviado para fila comum de fallback
     expect(mockQueue.sent.length).toBe(0);
   });
+  it('dispatches WhatsApp directly to Evolution Go (/send/text) when EVOLUTION_URL is configured without BACKEND_ORIGIN', async () => {
+    const { env, mockQueue } = createMockEnv({
+      BACKEND_ORIGIN: '',
+      EVOLUTION_URL: 'https://evolution.supletivo.net.br',
+      EVOLUTION_API_KEY: 'test-evolution-key',
+    });
+
+    let requestedUrl = '';
+    let requestedHeaders: Record<string, string> = {};
+    let requestedBody: any = null;
+
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
+      requestedUrl = url;
+      requestedHeaders = init.headers;
+      requestedBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({
+        id: 'evo-msg-123',
+        status: 'PENDING',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+
+    const res = await app.request('/v1/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel: 'whatsapp',
+        recipient: '5543996648750',
+        content: 'Teste direto Evolution Go',
+      }),
+    }, env);
+
+    expect(res.status).toBe(200);
+    const data: any = await res.json();
+    expect(data.ok).toBe(true);
+    expect(data.status).toBe('sent');
+    expect(data.driver).toBe('evolution-go');
+    expect(requestedUrl).toBe('https://evolution.supletivo.net.br/send/text');
+    expect(requestedHeaders['apikey']).toBe('test-evolution-key');
+    expect(requestedBody).toEqual({ number: '5543996648750', text: 'Teste direto Evolution Go' });
+    expect(mockQueue.sent).toHaveLength(0);
+  });
 });
