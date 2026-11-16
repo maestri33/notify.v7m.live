@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.code-review-graph
+.env
+.env.*
+.dev.vars*
+keys
+db.sqlite3
+media
+edge/node_modules
+edge/.wrangler

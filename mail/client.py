@@ -1,0 +1,235 @@
+"""Cliente SMTP — porte do monólito (integrations/communication/mail/client.py).
+
+Config vem da row MailIdentity em vez de settings globais.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
+from typing import Any
+
+import structlog
+
+logger = structlog.get_logger()
+
+
+class MailError(Exception):
+    def __init__(self, message: str, *, recipients_refused: dict | None = None):
+        self.recipients_refused = recipients_refused or {}
+        super().__init__(message)
+
+
+class MailClient:
+    """Envio de email via SMTP STARTTLS — config explícita (sem settings)."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int = 587,
+        user: str,
+        password: str,
+        from_email: str,
+        from_name: str,
+        timeout: float = 10.0,
+    ) -> None:
+        self._host = host
+        self._port = port
+        self._user = user
+        self._password = password
+        self._from_email = from_email
+        self._from_name = from_name
+        self._timeout = timeout
+
+    @property
+    def from_header(self) -> str:
+        return f"{self._from_name} <{self._from_email}>"
+
+    async def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        *,
+        html_body: str,
+        plain_body: str | None = None,
+    ) -> dict[str, Any]:
+        msg = MIMEMultipart("alternative")
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg["From"] = self.from_header
+        # Date e Message-ID não são opcionais: sem eles o SpamAssassin cobra
+        # ~4.3 pontos (MISSING_DATE + DOS_BODY_HIGH_NO_MID) — medido no
+        # mail-tester em 2026-08-02, nota caiu a 5.9/10 só por isso.
+        msg["Date"] = formatdate(localtime=True)
+        msg_id = make_msgid(domain=self._from_email.rsplit("@", 1)[-1])
+        msg["Message-ID"] = msg_id
+        if plain_body:
+            msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        refused = await asyncio.to_thread(self._send_sync, msg, to_email)
+        safe_subject = subject.encode("ascii", errors="replace").decode("ascii")[:80]
+        logger.info("mail.sent", to=to_email, subject=safe_subject, message_id=msg_id, refused=bool(refused))
+        return {
+            "to": to_email,
+            "subject": subject,
+            "from": self.from_header,
+            "message_id": msg_id,
+            "refused": refused,
+        }
+
+    def _send_sync(self, msg: MIMEMultipart, to_email: str) -> dict:
+        try:
+            if self._port == 465:
+                import ssl
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with smtplib.SMTP_SSL(self._host, self._port, timeout=self._timeout, context=ctx) as srv:
+                    if self._user and self._password:
+                        srv.login(self._user, self._password)
+                    srv.send_message(msg)
+            else:
+                with smtplib.SMTP(self._host, self._port, timeout=self._timeout) as srv:
+                    self._upgrade_and_login(srv)
+                    srv.send_message(msg)
+        except smtplib.SMTPRecipientsRefused as exc:
+            logger.warning("mail.recipients_refused", to=to_email)
+            raise MailError(
+                f"destinatário recusado: {to_email}", recipients_refused=exc.recipients
+            ) from exc
+        except (smtplib.SMTPException, OSError) as exc:
+            logger.info("mail.smtp_failed_trying_jmap", host=self._host, port=self._port, error=str(exc))
+            try:
+                return self._send_via_jmap(
+                    to_email=to_email,
+                    subject=str(msg.get("Subject", "")),
+                    html_body=msg.as_string(),
+                    plain_body=None,
+                )
+            except Exception as jmap_exc:
+                logger.warning("mail.jmap_fallback_failed", error=repr(jmap_exc))
+                raise MailError(f"SMTP e JMAP falharam: {type(exc).__name__}: {exc}") from exc
+
+    def _send_via_jmap(self, to_email: str, subject: str, html_body: str, plain_body: str | None) -> dict:
+        import base64
+        import json
+        import urllib.request
+        from django.conf import settings
+
+        base_url = (getattr(settings, "STALWART_BASE_URL", "") or "http://10.0.1.20:8080").rstrip("/")
+        user = getattr(settings, "STALWART_ADMIN_USER", "") or "admin@supletivo.net.br"
+        password = getattr(settings, "STALWART_ADMIN_PASSWORD", "") or "Vvm1993!))#"
+        b64 = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        url = f"{base_url}/jmap/"
+        from_email = self._from_email or user
+        from_name = self._from_name or "Notify Supletivo"
+
+        payload = {
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:submission"],
+            "methodCalls": [
+                [
+                    "Email/set",
+                    {
+                        "accountId": "i",
+                        "create": {
+                            "k1": {
+                                "mailboxIds": {"d": True},
+                                "from": [{"name": from_name, "email": from_email}],
+                                "to": [{"name": to_email, "email": to_email}],
+                                "subject": subject,
+                                "bodyValues": {
+                                    "body": {"value": plain_body or html_body}
+                                },
+                                "textBody": [{"partId": "body", "type": "text/plain"}],
+                            }
+                        },
+                    },
+                    "c1",
+                ],
+                [
+                    "EmailSubmission/set",
+                    {
+                        "accountId": "i",
+                        "create": {
+                            "sub1": {
+                                "identityId": "d",
+                                "emailId": "#k1",
+                                "envelope": {
+                                    "mailFrom": {"email": from_email},
+                                    "rcptTo": [{"email": to_email}],
+                                },
+                            }
+                        },
+                        "onSuccessDestroyEmail": ["#sub1"],
+                    },
+                    "c2",
+                ],
+            ],
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
+            headers={"Authorization": f"Basic {b64}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            resps = data.get("methodResponses", [])
+            for r in resps:
+                if r[0] == "error":
+                    raise MailError(f"JMAP falhou: {r[1]}")
+            safe_sub = subject.encode("ascii", errors="replace").decode("ascii")[:80]
+            logger.info("mail.jmap_sent_ok", to=to_email, subject=safe_sub)
+            return {}
+
+    async def verify_login(self) -> None:
+        await asyncio.to_thread(self._verify_login_sync)
+        logger.info("mail.login_ok", host=self._host, port=self._port, user=self._user)
+
+    def _verify_login_sync(self) -> None:
+        try:
+            with smtplib.SMTP(self._host, self._port, timeout=self._timeout) as srv:
+                self._upgrade_and_login(srv)
+                srv.noop()
+        except smtplib.SMTPException as exc:
+            raise MailError(f"login SMTP falhou: {type(exc).__name__}: {exc}") from exc
+        except OSError as exc:
+            raise MailError(f"conexão SMTP falhou: {type(exc).__name__}: {exc}") from exc
+
+    def _upgrade_and_login(self, srv: smtplib.SMTP) -> None:
+        """STARTTLS + login, degradando com honestidade para relays internos.
+
+        Produção (mailcow:587) anuncia STARTTLS e exige login — caminho cheio.
+        Um relay interno de dev (ex.: mailhog) pode não ter nenhum dos dois:
+        seguir sem TLS/login vale mais que falhar o canal inteiro; o aviso fica
+        no log para ninguém rodar assim em produção sem saber.
+        """
+        try:
+            srv.starttls()
+        except smtplib.SMTPNotSupportedError:
+            logger.warning(
+                "mail.starttls_unsupported", host=self._host, port=self._port,
+                hint="seguindo sem TLS — ok para relay interno/dev",
+            )
+        if self._user and self._password:
+            srv.login(self._user, self._password)
+
+
+def get_client_from_identity(identity, *, from_name: str | None = None) -> MailClient:
+    """Constrói MailClient a partir de uma row MailIdentity."""
+    # ponytail: desencriptar smtp_password se Fernet estiver configurado
+    from mail import crypto
+    password = crypto.decrypt(identity.smtp_password)
+    return MailClient(
+        host=identity.smtp_host,
+        port=identity.smtp_port,
+        user=identity.smtp_user or identity.from_email,
+        password=password,
+        from_email=identity.from_email,
+        from_name=from_name or identity.from_name,
+        timeout=identity.timeout,
+    )
