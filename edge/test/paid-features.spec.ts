@@ -27,7 +27,7 @@ describe('Cloudflare Workers Paid Features on notify-edge', () => {
   });
 
   it('queueHandler processes Dead Letter Queue (DLQ) messages and marks them dead_letter in D1', async () => {
-    const { env, mockD1 } = createMockEnv();
+    const { env } = createMockEnv();
     const batch = createMockMessageBatch([
       {
         notification_id: 'dead-1',

@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 
 export type NotifyQueueMessage = {
@@ -69,7 +69,12 @@ async function timingSafeMatch(a: string, b: string): Promise<boolean> {
   return mismatch === 0;
 }
 
-async function authorize(c: import('hono').Context<{ Bindings: Env; Variables: Variables }>): Promise<Response | null> {
+async function sha256Hex(text: string): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function authorize(c: Context<{ Bindings: Env; Variables: Variables }>): Promise<Response | null> {
   const env = c.env;
   if (env.NOTIFY_REQUIRE_AUTH === false || env.NOTIFY_REQUIRE_AUTH === 'false') {
     c.set('isMasterKey', true);
@@ -93,10 +98,7 @@ async function authorize(c: import('hono').Context<{ Bindings: Env; Variables: V
   // 2. Verificacao Multi-Tenant: autenticacao por API Key individual de cada plataforma no D1
   if (env.DB) {
     try {
-      const encoder = new TextEncoder();
-      const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(rawKey));
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      const keyHash = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+      const keyHash = await sha256Hex(rawKey);
 
       let row: any = null;
       try {
@@ -202,11 +204,7 @@ app.post('/v1/admin/apps', async (c) => {
   const accountId = crypto.randomUUID();
   const apiKeyId = crypto.randomUUID();
   const rawApiKey = `v7m_${crypto.randomUUID().replace(/-/g, '')}`;
-
-  const encoder = new TextEncoder();
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(rawApiKey));
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const keyHash = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+  const keyHash = await sha256Hex(rawApiKey);
 
   try {
     await c.env.DB.batch([
@@ -358,6 +356,13 @@ async function resolveWhatsAppInstance(
   return 'default';
 }
 
+function getEvolutionEndpoint(baseUrl: string, instanceName: string, isV2: boolean): string {
+  const base = baseUrl.replace(/\/$/, '');
+  return isV2
+    ? `${base}/message/sendText/${encodeURIComponent(instanceName)}`
+    : `${base}/send/text`;
+}
+
 // ── 3. Edge Notification Ingestion (/notify & /v1/send) ───────────────────
 const handleSend = async (c: any) => {
   let body: any;
@@ -385,10 +390,8 @@ const handleSend = async (c: any) => {
   const isMasterKey = typeof c.get === 'function' ? c.get('isMasterKey') : true;
   const authorizedSlug = typeof c.get === 'function' ? c.get('accountSlug') : undefined;
 
-  let accountSlug = 'default';
-  if (isMasterKey) {
-    accountSlug = requestedSlug || 'default';
-  } else if (authorizedSlug) {
+  let accountSlug = requestedSlug || 'default';
+  if (!isMasterKey && authorizedSlug) {
     if (requestedSlug && requestedSlug !== authorizedSlug) {
       return c.json(
         { error: 'Forbidden: You cannot dispatch notifications for another account slug (BOLA blocked)' },
@@ -396,8 +399,6 @@ const handleSend = async (c: any) => {
       );
     }
     accountSlug = authorizedSlug;
-  } else {
-    accountSlug = requestedSlug || 'default';
   }
 
   const caller = body.caller || body.options?.caller || body.extra?.caller || '';
@@ -444,16 +445,12 @@ const handleSend = async (c: any) => {
           }
         } else {
           const isExistingOtp = isOtp || existing.caller === 'users.auth.otp';
-          if (isExistingOtp) {
-            if (ageMs < 60000) {
-              const cached = JSON.parse(existing.response_json);
-              c.header('X-Idempotent-Replay', 'true');
-              c.header('X-OTP-Cooldown-Remaining-S', Math.max(0, Math.ceil((60000 - ageMs) / 1000)).toString());
-              return c.json(cached);
-            }
-          } else {
+          if (!isExistingOtp || ageMs < 60000) {
             const cached = JSON.parse(existing.response_json);
             c.header('X-Idempotent-Replay', 'true');
+            if (isExistingOtp) {
+              c.header('X-OTP-Cooldown-Remaining-S', Math.max(0, Math.ceil((60000 - ageMs) / 1000)).toString());
+            }
             return c.json(cached);
           }
         }
@@ -526,15 +523,12 @@ const handleSend = async (c: any) => {
     // Disparo Direto Serverless na Evolution (Go em Producao / Node v2 em Testes)
     try {
       const isV2 = c.env.WHATSAPP_TEST_DRIVER === 'evolution-v2' || c.env.EVOLUTION_URL.includes(':8085');
-      const baseEvoUrl = c.env.EVOLUTION_URL.replace(/\/$/, '');
       const instanceName = await resolveWhatsAppInstance(
         c.env,
         accountSlug,
         body.instance || body.options?.instance || body.whatsapp_instance
       );
-      const evolutionEndpoint = isV2
-        ? `${baseEvoUrl}/message/sendText/${encodeURIComponent(instanceName)}`
-        : `${baseEvoUrl}/send/text`;
+      const evolutionEndpoint = getEvolutionEndpoint(c.env.EVOLUTION_URL, instanceName, isV2);
 
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -1018,15 +1012,12 @@ export const queueHandler = async (
       try {
         if (item.channel === 'whatsapp' && env.EVOLUTION_URL) {
           const isV2 = env.WHATSAPP_TEST_DRIVER === 'evolution-v2' || env.EVOLUTION_URL.includes(':8085');
-          const baseEvoUrl = env.EVOLUTION_URL.replace(/\/$/, '');
           const instanceName = await resolveWhatsAppInstance(
             env,
             item.account_slug || 'default',
             item.payload?.instance || item.payload?.options?.instance || item.payload?.whatsapp_instance
           );
-          const evolutionEndpoint = isV2
-            ? `${baseEvoUrl}/message/sendText/${encodeURIComponent(instanceName)}`
-            : `${baseEvoUrl}/send/text`;
+          const evolutionEndpoint = getEvolutionEndpoint(env.EVOLUTION_URL, instanceName, isV2);
 
           const headers: Record<string, string> = { 'Content-Type': 'application/json' };
           if (env.EVOLUTION_API_KEY) headers['apikey'] = env.EVOLUTION_API_KEY;
