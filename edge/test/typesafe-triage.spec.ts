@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { triageWithJev, TriageResult } from '../src/typesafe-triage';
+import { triageWithJev } from '../src/typesafe-triage';
 
 describe('TypeSafe AI (System One - Jev) Triage Engine', () => {
   it('deve classificar intenção financeira e urgência normal via Jev System One', async () => {

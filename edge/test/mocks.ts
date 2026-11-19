@@ -5,6 +5,8 @@ export type MockD1 = {
   notifications: Map<string, any>;
   idempotency_keys: Map<string, any>;
   api_keys: Map<string, any>;
+  accounts: Map<string, any>;
+  whatsapp_numbers: Map<string, any>;
   shouldFail: boolean;
   db: any;
 };
@@ -13,6 +15,8 @@ export function createMockD1(): MockD1 {
   const notifications = new Map<string, any>();
   const idempotency_keys = new Map<string, any>();
   const api_keys = new Map<string, any>();
+  const accounts = new Map<string, any>();
+  const whatsapp_numbers = new Map<string, any>();
   const state = { shouldFail: false };
 
   const db = {
@@ -33,10 +37,25 @@ export function createMockD1(): MockD1 {
           if (sql.includes('SELECT 1 as alive')) {
             return { alive: 1 } as unknown as T;
           }
-          if (sql.includes('FROM api_keys')) {
+          if (sql.includes('FROM api_keys k JOIN accounts a') || sql.includes('FROM api_keys')) {
             const [hash] = boundArgs;
             const row = api_keys.get(hash);
-            return (row || null) as unknown as T;
+            if (!row) return null;
+            const account = accounts.get(row.account_id);
+            return {
+              id: row.id,
+              account_id: row.account_id,
+              account_slug: account?.slug || row.account_slug || row.account_id,
+            } as unknown as T;
+          }
+          if (sql.includes('FROM whatsapp_numbers')) {
+            const [accIdOrSlug] = boundArgs;
+            for (const wn of whatsapp_numbers.values()) {
+              if (wn.account_id === accIdOrSlug || wn.account_slug === accIdOrSlug) {
+                return wn as unknown as T;
+              }
+            }
+            return null;
           }
           if (sql.includes('FROM idempotency_keys')) {
             let accountSlug = '';
@@ -100,6 +119,22 @@ export function createMockD1(): MockD1 {
             }
             return { success: true };
           }
+          if (sql.includes('INSERT INTO idempotency_keys') && !sql.includes('OR REPLACE')) {
+            const [key, accountSlug, caller, expiresAt] = boundArgs;
+            const compoundKey = `${key}:${accountSlug}`;
+            if (idempotency_keys.has(compoundKey)) {
+              throw new Error('UNIQUE constraint failed: idempotency_keys.account_slug, idempotency_keys.key');
+            }
+            idempotency_keys.set(compoundKey, {
+              key,
+              account_slug: accountSlug,
+              response_json: '{"status":"in_progress"}',
+              caller,
+              created_at: new Date().toISOString(),
+              expires_at: expiresAt,
+            });
+            return { success: true };
+          }
           if (sql.includes('INSERT OR REPLACE INTO idempotency_keys')) {
             const [key, accountSlug, responseJson, caller, expiresAt] = boundArgs;
             const compoundKey = `${key}:${accountSlug}`;
@@ -113,9 +148,53 @@ export function createMockD1(): MockD1 {
             });
             return { success: true };
           }
+          if (sql.includes('DELETE FROM idempotency_keys')) {
+            const [accountSlug, key] = boundArgs;
+            const compoundKey = `${key}:${accountSlug}`;
+            idempotency_keys.delete(compoundKey);
+            return { success: true };
+          }
+          if (sql.includes('INSERT INTO accounts')) {
+            const [id, slug, name, webhookUrl, webhookSecret] = boundArgs;
+            accounts.set(id, {
+              id,
+              slug,
+              name,
+              webhook_url: webhookUrl,
+              webhook_secret: webhookSecret,
+              is_active: 1,
+              created_at: new Date().toISOString(),
+            });
+            return { success: true };
+          }
+          if (sql.includes('INSERT INTO api_keys')) {
+            const [id, accountId, keyHash, name] = boundArgs;
+            api_keys.set(keyHash, {
+              id,
+              account_id: accountId,
+              key_hash: keyHash,
+              name,
+              is_active: 1,
+            });
+            return { success: true };
+          }
+          if (sql.includes('INSERT INTO whatsapp_numbers')) {
+            const [id, accountId, instanceName, phoneNumber] = boundArgs;
+            whatsapp_numbers.set(id, {
+              id,
+              account_id: accountId,
+              instance_name: instanceName,
+              phone_number: phoneNumber,
+              is_default: 1,
+            });
+            return { success: true };
+          }
           return { success: true };
         },
         all: async <T = any>(): Promise<{ results: T[] }> => {
+          if (sql.includes('FROM accounts')) {
+            return { results: Array.from(accounts.values()) as unknown as T[] };
+          }
           return { results: [] };
         },
       };
@@ -127,6 +206,8 @@ export function createMockD1(): MockD1 {
     notifications,
     idempotency_keys,
     api_keys,
+    accounts,
+    whatsapp_numbers,
     get shouldFail() {
       return state.shouldFail;
     },
