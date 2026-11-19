@@ -32,7 +32,13 @@ export type Env = {
   EMAIL_SENDER?: string;
 };
 
-export const app = new Hono<{ Bindings: Env }>();
+export type Variables = {
+  isMasterKey?: boolean;
+  accountId?: string;
+  accountSlug?: string;
+};
+
+export const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 app.use('*', cors());
 
@@ -49,39 +55,71 @@ function originPayload(payload: Record<string, any>, targetPath: string, notific
   return result;
 }
 
-async function authorize(request: Request, env: Env): Promise<Response | null> {
-  if (env.NOTIFY_REQUIRE_AUTH === false || env.NOTIFY_REQUIRE_AUTH === 'false') return null;
+async function timingSafeMatch(a: string, b: string): Promise<boolean> {
+  if (!a || !b) return false;
+  const encoder = new TextEncoder();
+  const [hashA, hashB] = await Promise.all([
+    new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(a))),
+    new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(b))),
+  ]);
+  let mismatch = 0;
+  for (let i = 0; i < hashA.length; i++) {
+    mismatch |= hashA[i] ^ hashB[i];
+  }
+  return mismatch === 0;
+}
+
+async function authorize(c: import('hono').Context<{ Bindings: Env; Variables: Variables }>): Promise<Response | null> {
+  const env = c.env;
+  if (env.NOTIFY_REQUIRE_AUTH === false || env.NOTIFY_REQUIRE_AUTH === 'false') {
+    c.set('isMasterKey', true);
+    return null;
+  }
   if (!env.NOTIFY_API_KEY) {
     return Response.json({ error: 'Notification authentication is not configured' }, { status: 503 });
   }
-  const token = request.headers.get('Authorization') || '';
+  const token = c.req.header('Authorization') || '';
   if (!token.startsWith('Bearer ')) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
   const rawKey = token.replace(/^Bearer\s+/, '').trim();
 
   // 1. Verificacao da chave mestra global (NOTIFY_API_KEY) via timing-safe SHA-256
-  const encoder = new TextEncoder();
-  const [receivedHash, expectedHash] = await Promise.all([
-    rawKey,
-    env.NOTIFY_API_KEY,
-  ].map(async (value) => new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value)))));
-  let mismatch = 0;
-  for (let i = 0; i < receivedHash.length; i++) mismatch |= receivedHash[i] ^ expectedHash[i];
-  if (mismatch === 0) return null;
+  if (await timingSafeMatch(rawKey, env.NOTIFY_API_KEY)) {
+    c.set('isMasterKey', true);
+    return null;
+  }
 
   // 2. Verificacao Multi-Tenant: autenticacao por API Key individual de cada plataforma no D1
   if (env.DB) {
     try {
+      const encoder = new TextEncoder();
       const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(rawKey));
       const hashArray = Array.from(new Uint8Array(hashBuffer));
       const keyHash = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 
-      const row: any = await env.DB.prepare(
-        'SELECT id, account_id FROM api_keys WHERE key_hash = ? AND is_active = 1'
-      ).bind(keyHash).first();
+      let row: any = null;
+      try {
+        row = await env.DB.prepare(
+          `SELECT k.id, k.account_id, a.slug as account_slug 
+           FROM api_keys k 
+           JOIN accounts a ON k.account_id = a.id 
+           WHERE k.key_hash = ? AND k.is_active = 1 AND a.is_active = 1`
+        ).bind(keyHash).first();
+      } catch {
+        row = null;
+      }
+
+      if (!row) {
+        row = await env.DB.prepare(
+          'SELECT id, account_id FROM api_keys WHERE key_hash = ? AND is_active = 1'
+        ).bind(keyHash).first();
+      }
 
       if (row) {
+        c.set('isMasterKey', false);
+        c.set('accountId', row.account_id);
+        c.set('accountSlug', row.account_slug || row.account_id);
         return null;
       }
     } catch {
@@ -95,7 +133,7 @@ async function authorize(request: Request, env: Env): Promise<Response | null> {
 for (const path of ['/notify', '/v1/send', '/mcp', '/reports/*']) {
   app.use(path, async (c, next) => {
     if (c.req.method === 'OPTIONS') return next();
-    const rejection = await authorize(c.req.raw, c.env);
+    const rejection = await authorize(c);
     return rejection || next();
   });
 }
@@ -105,7 +143,6 @@ app.use('/v1/admin/*', async (c, next) => {
   if (c.req.method === 'OPTIONS') return next();
   const cfClientId = c.req.header('CF-Access-Client-Id');
   const cfClientSecret = c.req.header('CF-Access-Client-Secret');
-  const adminSecret = c.env.BACKEND_SERVICE_TOKEN || c.env.NOTIFY_API_KEY;
   const authHeader = c.req.header('Authorization') || '';
 
   // 1. Autorização via Cloudflare Service Token (m2m / Zero Trust)
@@ -113,12 +150,109 @@ app.use('/v1/admin/*', async (c, next) => {
     return next();
   }
 
-  // 2. Autorização via Bearer com token master de administração/infraestrutura
-  if (adminSecret && authHeader === `Bearer ${adminSecret}`) {
-    return next();
+  // 2. Autorização via Bearer com token master de administração/infraestrutura (timing-safe VULN-03)
+  if (authHeader.startsWith('Bearer ')) {
+    const rawToken = authHeader.replace(/^Bearer\s+/, '').trim();
+    if (c.env.BACKEND_SERVICE_TOKEN && (await timingSafeMatch(rawToken, c.env.BACKEND_SERVICE_TOKEN))) {
+      return next();
+    }
+    if (c.env.NOTIFY_API_KEY && (await timingSafeMatch(rawToken, c.env.NOTIFY_API_KEY))) {
+      return next();
+    }
   }
 
   return c.json({ error: 'Acesso restrito ao administrador de infraestrutura.' }, 403);
+});
+
+// ── 0.2 Rotas Administrativas (/v1/admin/*) ────────────────────────────────
+app.get('/v1/admin/apps', async (c) => {
+  if (!c.env.DB) {
+    return c.json({ ok: false, error: 'Database not available' }, 503);
+  }
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT a.id, a.slug, a.name, a.webhook_url, a.is_active, a.created_at,
+              wn.instance_name, wn.phone_number
+       FROM accounts a
+       LEFT JOIN whatsapp_numbers wn ON wn.account_id = a.id AND wn.is_default = 1
+       ORDER BY a.created_at DESC`
+    ).all();
+    return c.json({ ok: true, apps: results || [] });
+  } catch (err: any) {
+    return c.json({ ok: false, error: err.message }, 500);
+  }
+});
+
+app.post('/v1/admin/apps', async (c) => {
+  if (!c.env.DB) {
+    return c.json({ ok: false, error: 'Database not available' }, 503);
+  }
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ ok: false, error: 'Invalid JSON payload' }, 400);
+  }
+
+  const { slug, name, phone_number, instance_name, webhook_url, webhook_secret } = body;
+  if (!slug || !name) {
+    return c.json({ ok: false, error: 'Missing mandatory fields: slug and name are required' }, 400);
+  }
+
+  const accountId = crypto.randomUUID();
+  const apiKeyId = crypto.randomUUID();
+  const rawApiKey = `v7m_${crypto.randomUUID().replace(/-/g, '')}`;
+
+  const encoder = new TextEncoder();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(rawApiKey));
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const keyHash = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO accounts (id, slug, name, webhook_url, webhook_secret, is_active)
+         VALUES (?, ?, ?, ?, ?, 1)`
+      ).bind(accountId, slug, name, webhook_url || null, webhook_secret || null),
+      c.env.DB.prepare(
+        `INSERT INTO api_keys (id, account_id, key_hash, name, is_active)
+         VALUES (?, ?, ?, ?, 1)`
+      ).bind(apiKeyId, accountId, keyHash, `API Key - ${name}`),
+      ...(instance_name || phone_number
+        ? [
+            c.env.DB.prepare(
+              `INSERT INTO whatsapp_numbers (id, account_id, instance_name, phone_number, is_default)
+               VALUES (?, ?, ?, ?, 1)`
+            ).bind(crypto.randomUUID(), accountId, instance_name || 'default', phone_number || null),
+          ]
+        : []),
+    ]);
+
+    return c.json(
+      {
+        ok: true,
+        account: {
+          id: accountId,
+          slug,
+          name,
+        },
+        api_key: rawApiKey,
+        instance_name: instance_name || 'default',
+      },
+      201
+    );
+  } catch (err: any) {
+    return c.json({ ok: false, error: `Failed to provision app: ${err.message}` }, 500);
+  }
+});
+
+app.get('/v1/admin/status', async (c) => {
+  return c.json({
+    ok: true,
+    service: 'notify-edge-admin',
+    environment: c.env.ENVIRONMENT || 'production',
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ── 0. Root Service Info ───────────────────────────────────────────────────
@@ -196,6 +330,34 @@ app.get('/media/*', async (c) => {
   return new Response(object.body, { headers });
 });
 
+async function resolveWhatsAppInstance(
+  env: Env,
+  accountIdOrSlug: string,
+  requestedInstance?: string
+): Promise<string> {
+  if (requestedInstance && typeof requestedInstance === 'string' && requestedInstance.trim()) {
+    return requestedInstance.trim();
+  }
+  if (env.DB) {
+    try {
+      const row: any = await env.DB.prepare(
+        `SELECT wn.instance_name 
+         FROM whatsapp_numbers wn
+         LEFT JOIN accounts a ON wn.account_id = a.id
+         WHERE (wn.account_id = ? OR a.slug = ? OR a.id = ?) AND wn.is_default = 1
+         LIMIT 1`
+      ).bind(accountIdOrSlug, accountIdOrSlug, accountIdOrSlug).first();
+
+      if (row?.instance_name) {
+        return row.instance_name;
+      }
+    } catch {
+      // Fallback silencioso
+    }
+  }
+  return 'default';
+}
+
 // ── 3. Edge Notification Ingestion (/notify & /v1/send) ───────────────────
 const handleSend = async (c: any) => {
   let body: any;
@@ -218,7 +380,26 @@ const handleSend = async (c: any) => {
     return c.json({ ok: false, status: 'failed', error: 'Notification origin is not configured' }, 503);
   }
 
-  const accountSlug = c.req.header('X-Account-Slug') || body.account_id || 'default';
+  // VULN-01 (BOLA): Prevenção de spoofing de conta por API key individual
+  const requestedSlug = c.req.header('X-Account-Slug') || body.account_id || null;
+  const isMasterKey = typeof c.get === 'function' ? c.get('isMasterKey') : true;
+  const authorizedSlug = typeof c.get === 'function' ? c.get('accountSlug') : undefined;
+
+  let accountSlug = 'default';
+  if (isMasterKey) {
+    accountSlug = requestedSlug || 'default';
+  } else if (authorizedSlug) {
+    if (requestedSlug && requestedSlug !== authorizedSlug) {
+      return c.json(
+        { error: 'Forbidden: You cannot dispatch notifications for another account slug (BOLA blocked)' },
+        403
+      );
+    }
+    accountSlug = authorizedSlug;
+  } else {
+    accountSlug = requestedSlug || 'default';
+  }
+
   const caller = body.caller || body.options?.caller || body.extra?.caller || '';
   const isOtp =
     caller === 'users.auth.otp' ||
@@ -227,33 +408,55 @@ const handleSend = async (c: any) => {
     body.extra?.is_otp === true;
   const isSynchronous = isOtp || body.run_sync === true || body.options?.run_sync === true;
 
-  // 1. Verificação de idempotência no D1 com suporte a cooldown inteligente de OTP (60s)
-  if (idempotency_key) {
-    const existing: any = await c.env.DB.prepare(
-      'SELECT response_json, created_at, expires_at, caller FROM idempotency_keys WHERE account_slug = ? AND key = ?'
-    )
-      .bind(accountSlug, idempotency_key)
-      .first();
+  // 1. Verificação e Reserva Atômica de Idempotência no D1 (VULN-02)
+  if (idempotency_key && c.env.DB) {
+    let reserved = false;
+    try {
+      const expiresAt = isOtp ? new Date(Date.now() + 60000).toISOString() : null;
+      await c.env.DB.prepare(
+        `INSERT INTO idempotency_keys (key, account_slug, response_json, caller, created_at, expires_at)
+         VALUES (?, ?, '{"status":"in_progress"}', ?, CURRENT_TIMESTAMP, ?)`
+      )
+        .bind(idempotency_key, accountSlug, caller || null, expiresAt)
+        .run();
+      reserved = true;
+    } catch {
+      // Já existe registro ou chave primária duplicada
+    }
 
-    if (existing) {
-      const isExistingOtp = isOtp || existing.caller === 'users.auth.otp';
-      const rawDate = existing.created_at || '';
-      const isoDate = rawDate.includes('T') ? rawDate : rawDate.replace(' ', 'T') + 'Z';
-      const createdAtMs = new Date(isoDate).getTime();
-      const ageMs = Date.now() - createdAtMs;
+    if (!reserved) {
+      const existing: any = await c.env.DB.prepare(
+        'SELECT response_json, created_at, expires_at, caller FROM idempotency_keys WHERE account_slug = ? AND key = ?'
+      )
+        .bind(accountSlug, idempotency_key)
+        .first();
 
-      // Se for OTP: dentro de 60s retorna o replay. Passados 60s, permite novo envio legítimo.
-      if (isExistingOtp) {
-        if (ageMs < 60000) {
-          const cached = JSON.parse(existing.response_json);
-          c.header('X-Idempotent-Replay', 'true');
-          c.header('X-OTP-Cooldown-Remaining-S', Math.max(0, Math.ceil((60000 - ageMs) / 1000)).toString());
-          return c.json(cached);
+      if (existing) {
+        const rawDate = existing.created_at || '';
+        const isoDate = rawDate.includes('T') ? rawDate : rawDate.replace(' ', 'T') + 'Z';
+        const createdAtMs = new Date(isoDate).getTime();
+        const ageMs = Date.now() - createdAtMs;
+
+        if (existing.response_json && existing.response_json.includes('"status":"in_progress"')) {
+          if (ageMs < 30000) {
+            c.header('X-Idempotent-In-Progress', 'true');
+            return c.json({ ok: false, status: 'in_progress', error: 'Duplicate request already in progress' }, 409);
+          }
+        } else {
+          const isExistingOtp = isOtp || existing.caller === 'users.auth.otp';
+          if (isExistingOtp) {
+            if (ageMs < 60000) {
+              const cached = JSON.parse(existing.response_json);
+              c.header('X-Idempotent-Replay', 'true');
+              c.header('X-OTP-Cooldown-Remaining-S', Math.max(0, Math.ceil((60000 - ageMs) / 1000)).toString());
+              return c.json(cached);
+            }
+          } else {
+            const cached = JSON.parse(existing.response_json);
+            c.header('X-Idempotent-Replay', 'true');
+            return c.json(cached);
+          }
         }
-      } else {
-        const cached = JSON.parse(existing.response_json);
-        c.header('X-Idempotent-Replay', 'true');
-        return c.json(cached);
       }
     }
   }
@@ -279,8 +482,17 @@ const handleSend = async (c: any) => {
     .run();
 
   const rejectDispatch = async (error: string, status = 503, details: Record<string, any> = {}) => {
-    await c.env.DB.prepare("UPDATE notifications SET status = 'failed' WHERE id = ?")
-      .bind(notificationId).run();
+    try {
+      if (c.env.DB) {
+        await c.env.DB.prepare("UPDATE notifications SET status = 'failed' WHERE id = ?")
+          .bind(notificationId).run();
+        if (idempotency_key) {
+          await c.env.DB.prepare(
+            "DELETE FROM idempotency_keys WHERE account_slug = ? AND key = ? AND response_json LIKE '%in_progress%'"
+          ).bind(accountSlug, idempotency_key).run();
+        }
+      }
+    } catch {}
     return c.json({ ...details, ok: false, status: details.status || 'failed', error }, status);
   };
 
@@ -315,9 +527,14 @@ const handleSend = async (c: any) => {
     try {
       const isV2 = c.env.WHATSAPP_TEST_DRIVER === 'evolution-v2' || c.env.EVOLUTION_URL.includes(':8085');
       const baseEvoUrl = c.env.EVOLUTION_URL.replace(/\/$/, '');
+      const instanceName = await resolveWhatsAppInstance(
+        c.env,
+        accountSlug,
+        body.instance || body.options?.instance || body.whatsapp_instance
+      );
       const evolutionEndpoint = isV2
-        ? baseEvoUrl + '/message/sendText/default'
-        : baseEvoUrl + '/send/text';
+        ? `${baseEvoUrl}/message/sendText/${encodeURIComponent(instanceName)}`
+        : `${baseEvoUrl}/send/text`;
 
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -667,6 +884,8 @@ app.post('/mcp', async (c) => {
         },
         env: c.env,
         header: () => {},
+        get: (name: string) => (typeof (c as any).get === 'function' ? (c as any).get(name) : undefined),
+        set: () => {},
         json: (data: any, status = 200) => ({ data, status }),
       };
       const res: any = await handleSend(mockReq as any);
@@ -800,9 +1019,14 @@ export const queueHandler = async (
         if (item.channel === 'whatsapp' && env.EVOLUTION_URL) {
           const isV2 = env.WHATSAPP_TEST_DRIVER === 'evolution-v2' || env.EVOLUTION_URL.includes(':8085');
           const baseEvoUrl = env.EVOLUTION_URL.replace(/\/$/, '');
+          const instanceName = await resolveWhatsAppInstance(
+            env,
+            item.account_slug || 'default',
+            item.payload?.instance || item.payload?.options?.instance || item.payload?.whatsapp_instance
+          );
           const evolutionEndpoint = isV2
-            ? baseEvoUrl + '/message/sendText/default'
-            : baseEvoUrl + '/send/text';
+            ? `${baseEvoUrl}/message/sendText/${encodeURIComponent(instanceName)}`
+            : `${baseEvoUrl}/send/text`;
 
           const headers: Record<string, string> = { 'Content-Type': 'application/json' };
           if (env.EVOLUTION_API_KEY) headers['apikey'] = env.EVOLUTION_API_KEY;
