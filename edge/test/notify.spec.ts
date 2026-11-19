@@ -377,4 +377,39 @@ describe('POST /notify & /v1/send routing and contracts', () => {
     expect(requestedBody).toEqual({ number: '5543996648750', text: 'Teste direto Evolution Go', formatJid: true });
     expect(mockQueue.sent).toHaveLength(0);
   });
+
+  it('supports Secrets Store binding object for EVOLUTION_API_KEY without setting [object Object]', async () => {
+    const mockSecret = {
+      get: vi.fn().mockResolvedValue('secret-from-secrets-store'),
+    };
+    const { env } = createMockEnv({
+      BACKEND_ORIGIN: '',
+      EVOLUTION_URL: 'https://evolution.supletivo.net.br',
+      EVOLUTION_API_KEY: mockSecret as any,
+    });
+
+    let requestedHeaders: Record<string, string> = {};
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+      requestedHeaders = init.headers;
+      return new Response(JSON.stringify({ id: 'evo-msg-456', status: 'PENDING' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const res = await app.request('/v1/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel: 'whatsapp',
+        recipient: '5543996648750',
+        content: 'Teste Secrets Store',
+      }),
+    }, env);
+
+    expect(res.status).toBe(200);
+    expect(mockSecret.get).toHaveBeenCalled();
+    expect(requestedHeaders['apikey']).toBe('secret-from-secrets-store');
+    expect(requestedHeaders['apikey']).not.toContain('[object');
+  });
 });

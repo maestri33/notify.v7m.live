@@ -26,7 +26,7 @@ export type Env = {
   NOTIFY_API_KEY?: string;
   NOTIFY_REQUIRE_AUTH?: string | boolean;
   EVOLUTION_URL?: string;
-  EVOLUTION_API_KEY?: string;
+  EVOLUTION_API_KEY?: string | { get(): Promise<string> } | any;
   WHATSAPP_TEST_DRIVER?: string;
   EMAIL?: any;
   EMAIL_SENDER?: string;
@@ -72,6 +72,19 @@ async function timingSafeMatch(a: string, b: string): Promise<boolean> {
 async function sha256Hex(text: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function resolveSecretString(secret: unknown): Promise<string | undefined> {
+  if (!secret) return undefined;
+  if (typeof secret === 'object' && typeof (secret as any).get === 'function') {
+    try {
+      const val = await (secret as any).get();
+      return typeof val === 'string' ? val : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return typeof secret === 'string' ? secret : undefined;
 }
 
 async function authorize(c: Context<{ Bindings: Env; Variables: Variables }>): Promise<Response | null> {
@@ -533,8 +546,9 @@ const handleSend = async (c: any) => {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
       };
-      if (c.env.EVOLUTION_API_KEY) {
-        headers['apikey'] = c.env.EVOLUTION_API_KEY;
+      const evoApiKey = await resolveSecretString(c.env.EVOLUTION_API_KEY);
+      if (evoApiKey) {
+        headers['apikey'] = evoApiKey;
       }
 
       const resp = await fetch(evolutionEndpoint, {
@@ -1021,7 +1035,8 @@ export const queueHandler = async (
           const evolutionEndpoint = getEvolutionEndpoint(env.EVOLUTION_URL, instanceName, isV2);
 
           const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-          if (env.EVOLUTION_API_KEY) headers['apikey'] = env.EVOLUTION_API_KEY;
+          const evoApiKey = await resolveSecretString(env.EVOLUTION_API_KEY);
+          if (evoApiKey) headers['apikey'] = evoApiKey;
 
           const resp = await fetch(evolutionEndpoint, {
             method: 'POST',
