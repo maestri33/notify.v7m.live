@@ -10,7 +10,7 @@ routes = [
 
 [vars]
 ENVIRONMENT = "production"
-EVOLUTION_URL = "https://evolution.supletivo.net.br"
+EVOLUTION_URL = "https://whatsapp.v7m.live"
 
 [[d1_databases]]
 binding = "DB"

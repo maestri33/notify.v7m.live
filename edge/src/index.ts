@@ -543,6 +543,7 @@ const handleSend = async (c: any) => {
         body: JSON.stringify({
           number: recipient,
           text: content,
+          formatJid: true,
         }),
         signal: AbortSignal.timeout(10000),
       });

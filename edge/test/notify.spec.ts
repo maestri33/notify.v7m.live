@@ -374,7 +374,7 @@ describe('POST /notify & /v1/send routing and contracts', () => {
     expect(data.driver).toBe('evolution-go');
     expect(requestedUrl).toBe('https://evolution.supletivo.net.br/send/text');
     expect(requestedHeaders['apikey']).toBe('test-evolution-key');
-    expect(requestedBody).toEqual({ number: '5543996648750', text: 'Teste direto Evolution Go' });
+    expect(requestedBody).toEqual({ number: '5543996648750', text: 'Teste direto Evolution Go', formatJid: true });
     expect(mockQueue.sent).toHaveLength(0);
   });
 });
